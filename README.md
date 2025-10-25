@@ -17,14 +17,15 @@ KipuBankV2 mejora el contrato anterior con:
 
 ---
 
-## 📁 Estructura del repositorio
+## 📁 Estructura del repo
 
-KipuBankV2/
-├─ src/
-│ └─ KipuBank.sol
+```
+kipu-bankV2/
+├─ contracts/
+│  └─ KipuBank.sol
 ├─ README.md
 └─ .gitignore
----
+```
 
 ## ⚙️ Cómo desplegar
 
