@@ -24,10 +24,6 @@ KipuBankV2/
 │ └─ KipuBank.sol
 ├─ README.md
 └─ .gitignore
-
-markdown
-Copy code
-
 ---
 
 ## ⚙️ Cómo desplegar
