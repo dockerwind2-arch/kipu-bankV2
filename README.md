@@ -84,5 +84,5 @@ kipu-bankV2/
 ## 📍 Dirección del contrato desplegado
 
 - **Testnet:** Sepolia  
-- **Dirección:** `0x515ee96f3bae4f4d6f8678bf493996c0defd91b4`  
-- **Código verificado en:** [Etherscan Sepolia](https://sepolia.etherscan.io/address/0x515ee96f3bae4f4d6f8678bf493996c0defd91b4#code)
+- **Dirección:** 0xccd1d34e313b7bf3dedfbc6586a701d19e45d24b  
+- **Código verificado en:** [Etherscan Sepolia](https://sepolia.etherscan.io/address/0xccd1d34e313b7bf3dedfbc6586a701d19e45d24b#code)
