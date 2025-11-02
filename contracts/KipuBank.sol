@@ -27,15 +27,14 @@ contract KipuBank is ReentrancyGuard, AccessControl  {
     /// @dev Se establece en el constructor y no puede modificarse.
     uint256 public immutable withdrawLimit;
 
-    /// @notice Capital global de depósitos que puede recibir el banco.
-    /// @dev Se establece en el constructor y no puede modificarse.
-    uint256 public immutable bankCap;
-
     /// @notice Capital global del banco en USD (8 decimales)
-    uint256 public bankCapUSD;
+    uint256 public immutable bankCapUSD;
 
-    /// @notice Registro del total depositado en el banco.
-    uint256 public totalDeposited;
+    /// @notice Total del banco por token: token => total units (ej: wei para ETH, unidades token para ERC20).
+    mapping(address => uint256) public totalDepositedByToken;
+
+    /// @notice Total del banco en USD (8 decimales). Se actualiza en cada depósito y retiro.
+    uint256 public bankTotalUSD;
 
     /// @notice Registro del número de depósitos realizados.
     uint256 public totalDeposits;
@@ -108,18 +107,19 @@ contract KipuBank is ReentrancyGuard, AccessControl  {
     /// @notice Error feed no disponible.
     error FeedNoDisponible();
 
+    /// @notice Error feed inválido.
+     error FeedStaleOrInvalid();
+
 
     /*//////////////////////////////////////////////////////////////
                                CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
     /// @param _withdrawLimit Límite máximo de retiro por transacción.
-    /// @param _bankCap Capital global de depósitos para el banco.
     /// @param _bankCapUSD Capital global de depósitos en dolares para el banco.
     /// @param _priceFeed dirección del oráculo ETH/USD.
-    constructor(uint256 _withdrawLimit, uint256 _bankCap, uint256 _bankCapUSD, address _priceFeed) {
+    constructor(uint256 _withdrawLimit, uint256 _bankCapUSD, address _priceFeed) {
         withdrawLimit = _withdrawLimit;
-        bankCap = _bankCap;
         bankCapUSD = _bankCapUSD;
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
@@ -147,58 +147,82 @@ contract KipuBank is ReentrancyGuard, AccessControl  {
                                 FUNCIONES
     //////////////////////////////////////////////////////////////*/
 
+
+    /// @notice Devuelve el total depositado en el contrato para un token (address(0) = ETH).
+    /// @param token Dirección del token o address(0) para ETH.
+    /// @return total depositado en unidades del token.
+    function getTotalDeposited(address token) external view returns (uint256 total) {
+        return totalDepositedByToken[token];
+    }
+
+    /// @notice Devuelve el total depositado por token en USD (8 decimales).
+    /// @param token Dirección del token (usar address(0) para ETH).
+    /// @return totalUSD Total en USD con 8 decimales.
+    function getTotalDepositedUSD(address token) external view returns (uint256 totalUSD) {
+        uint256 total = totalDepositedByToken[token];
+        if (total == 0) return 0;
+        return _tokenToUSD(token, total);
+}
+
+
+
     /// @notice Permite a un usuario depositar ETH en su bóveda.
     /// @dev Revierte si el depósito supera el límite global.
       function deposit() external payable nonReentrant{
-        if (msg.value == 0) revert DepositoInvalido();
+      if (msg.value == 0) revert DepositoInvalido();
 
+        // Convertir a USD (8 decimales)
         uint256 depositUSD = _ethToUSD(msg.value);
-        uint256 totalDepositedUSD = _ethToUSD(totalDeposited);
 
-        if (totalDepositedUSD + depositUSD > bankCapUSD) {
-            revert ErrorDepositoExcedeCap();
-        }
-        
-        if (totalDeposited + msg.value > bankCap) {
-            revert ErrorDepositoExcedeCap();
-        }
+        // Verificar bankCapUSD
+        if (bankTotalUSD + depositUSD > bankCapUSD) revert ErrorDepositoExcedeCap();
 
         vaults[msg.sender][address(0)] += msg.value;
-        totalDeposited += msg.value;
+        totalDepositedByToken[address(0)] += msg.value;
+        bankTotalUSD += depositUSD;
         totalDeposits++;
 
-       emit Deposited(msg.sender, msg.value);
+        emit Deposited(msg.sender, msg.value);
     }
 
     /// @notice Permite depositar ETH o tokens ERC20.
     /// @param token Dirección del token (usar address(0) para ETH).
     /// @param amount Monto a depositar (ignorado si es ETH).
     function depositToken(address token, uint256 amount) external payable nonReentrant validAmount(msg.value > 0 ? msg.value : amount) {
-        uint256 depositAmount;
-        
-        if (token == address(0)) {
+         uint256 depositAmount;
+         uint256 depositUSD;
+
+         if (token == address(0)) {
             // Deposito de ETH
             if (msg.value == 0) revert DepositoInvalido();
             depositAmount = msg.value;
-            if (totalDeposited + depositAmount > bankCap) revert ErrorDepositoExcedeCap();
+            depositUSD = _ethToUSD(depositAmount);
+
+            if (bankTotalUSD + depositUSD > bankCapUSD) revert ErrorDepositoExcedeCap();
+            
+            vaults[msg.sender][address(0)] += depositAmount;
+            totalDepositedByToken[address(0)] += depositAmount;
+            bankTotalUSD += depositUSD;
         } else {
             // Deposito de token ERC20
             depositAmount = amount;
+
             if (!IERC20(token).transferFrom(msg.sender, address(this), depositAmount)) {
                 revert ErrorTransferenciaFallida();
             }
+
+            // Convertir a USD (usamos el feed asignado para ese token)
+            depositUSD = _tokenToUSD(token, depositAmount);
+
+            if (bankTotalUSD + depositUSD > bankCapUSD) revert ErrorDepositoExcedeCap();
+
+            // Effects
+            vaults[msg.sender][token] += depositAmount;
+            totalDepositedByToken[token] += depositAmount;
+            bankTotalUSD += depositUSD;
         }
 
-        uint256 depositUSD = _tokenToUSD(token, depositAmount);
-        uint256 totalDepositedUSD = _tokenToUSD(address(0), totalDeposited);
-        if (totalDepositedUSD + depositUSD > bankCapUSD) {
-            revert ErrorDepositoExcedeCap();
-        }
-
-        vaults[msg.sender][token] += depositAmount;
-        totalDeposited += depositAmount;
         totalDeposits++;
-
         emit Deposited(msg.sender, depositAmount);
     }
 
@@ -207,34 +231,48 @@ contract KipuBank is ReentrancyGuard, AccessControl  {
     /// @dev Revierte si el retiro excede el limite y si los fondos son insuficientes.
     /// @param amount Monto a retirar en wei.
     function withdraw(uint256 amount) external validAmount(amount) nonReentrant{
-        if (amount > withdrawLimit) {
-            revert ErrorRetiroExcedeLimite();
-        }
-        if (vaults[msg.sender][address(0)] < amount){
-            revert ErrorFondosInsuficientes();
-        }
+        // Convertir el límite (ETH denom) a USD una sola vez
+        uint256 limitUSD = _ethToUSD(withdrawLimit);
+
+        uint256 amountUSD = _ethToUSD(amount);
+        if (amountUSD > limitUSD) revert ErrorRetiroExcedeLimite();
+        if (vaults[msg.sender][address(0)] < amount) revert ErrorFondosInsuficientes();
 
         vaults[msg.sender][address(0)] -= amount;
-        totalDeposited -= amount;
+        totalDepositedByToken[address(0)] -= amount;
+        if (bankTotalUSD >= amountUSD) {
+            bankTotalUSD -= amountUSD;
+        } else {
+            revert ErrorFondosInsuficientes();
+        }
         totalWithdrawals++;
-    
+
         _safeTransfer(address(0), msg.sender, amount);
-         emit Withdrawn(msg.sender, amount);
+        emit Withdrawn(msg.sender, amount);
     }
 
     /// @notice Permite retirar ETH o tokens ERC20 de la bóveda.
     /// @param token Dirección del token (usar address(0) para ETH).
     /// @param amount Monto a retirar.
     function withdrawToken(address token, uint256 amount) external validAmount(amount) nonReentrant{
-        if (amount > withdrawLimit) revert ErrorRetiroExcedeLimite();
+          
+        uint256 limitUSD = _ethToUSD(withdrawLimit);
+
+        uint256 amountUSD = _tokenToUSD(token, amount);
+        if (amountUSD > limitUSD) revert ErrorRetiroExcedeLimite();
         if (vaults[msg.sender][token] < amount) revert ErrorFondosInsuficientes();
 
+        // Effects
         vaults[msg.sender][token] -= amount;
-        totalDeposited -= amount;
+        totalDepositedByToken[token] -= amount;
+        if (bankTotalUSD >= amountUSD) {
+            bankTotalUSD -= amountUSD;
+        } else {
+            revert ErrorFondosInsuficientes();
+        }
         totalWithdrawals++;
 
         _safeTransfer(token, msg.sender, amount);
-
         emit Withdrawn(msg.sender, amount);
     }
 
@@ -267,21 +305,32 @@ contract KipuBank is ReentrancyGuard, AccessControl  {
         return vaults[user][token];
     }
     
-    /// @notice Devuelve el precio ETH/USD con 8 decimales.
+    /// @notice Devuelve el precio ETH/USD.
     /// @return price Precio actual de ETH en USD.
     function getLatestETHPrice() public view returns (int256 price) {
-        (, price, , ,) = priceFeed.latestRoundData();
+         (
+            ,
+            int256 p,
+            ,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        ) = priceFeed.latestRoundData();
+
+        // validaciones básicas del feed
+        if (p <= 0 || updatedAt == 0 || answeredInRound == 0) revert FeedStaleOrInvalid();
+
+        return p;
     }
 
     /// @notice Convierte ETH (wei) a USD usando Chainlink.
     /// @param amountETH Monto en wei.
     /// @return amountUSD Monto equivalente en USD (8 decimales).
     function _ethToUSD(uint256 amountETH) internal view returns (uint256 amountUSD) {
-        int256 price = getLatestETHPrice();
+        int256 price = getLatestETHPrice(); 
         if (price <= 0) revert DepositoInvalido();
-        amountUSD = (amountETH * uint256(price)) / 1e18;
+        amountUSD = (amountETH * uint256(price)) / (10 ** (18 + 8));
     }
-
+    
     /// @notice Convierte un monto de token a USD usando su feed.
     /// @param token Dirección del token (usar address(0) para ETH)
     /// @param amount Monto en unidades del token
@@ -289,36 +338,40 @@ contract KipuBank is ReentrancyGuard, AccessControl  {
     function _tokenToUSD(address token, uint256 amount) internal view returns (uint256 amountUSD) {
         AggregatorV3Interface feed = token == address(0) ? priceFeed : tokenPriceFeeds[token];
         if (address(feed) == address(0)) revert FeedNoDisponible();
-
-        (, int256 price,,,) = feed.latestRoundData();
-        if (price <= 0) revert DepositoInvalido();
-
+        ( , int256 price, , uint256 updatedAt, uint80 answeredInRound ) = feed.latestRoundData();
+        if (price <= 0 || updatedAt == 0 || answeredInRound == 0) revert FeedStaleOrInvalid();
         uint8 tokenDecimals = token == address(0) ? 18 : IERC20(token).decimals();
-        amountUSD = (amount * uint256(price)) / (10 ** tokenDecimals);
+        amountUSD = (amount * uint256(price)) / (10 ** (uint256(tokenDecimals) + 8));
     }
 
 
     /// @notice  Maneja depósitos directos de ETH enviados sin usar la función deposit().
     receive() external payable {
          if (msg.value == 0) revert DepositoInvalido();
+
         uint256 depositUSD = _ethToUSD(msg.value);
-        uint256 totalDepositedUSD = _ethToUSD(totalDeposited);
-        if (totalDeposited + msg.value > bankCap || totalDepositedUSD + depositUSD > bankCapUSD) revert ErrorDepositoExcedeCap();
+        if (bankTotalUSD + depositUSD > bankCapUSD) revert ErrorDepositoExcedeCap();
+        
         vaults[msg.sender][address(0)] += msg.value;
-        totalDeposited += msg.value;
+        totalDepositedByToken[address(0)] += msg.value;
+        bankTotalUSD += depositUSD;
         totalDeposits++;
+
         emit Deposited(msg.sender, msg.value);
     }
     
     /// @notice Maneja llamadas inválidas o funciones inexistentes, permitiendo depósito de ETH.
     fallback() external payable {
         if (msg.value == 0) revert DepositoInvalido();
+
         uint256 depositUSD = _ethToUSD(msg.value);
-        uint256 totalDepositedUSD = _ethToUSD(totalDeposited);
-        if (totalDeposited + msg.value > bankCap || totalDepositedUSD + depositUSD > bankCapUSD) revert ErrorDepositoExcedeCap();
+        if (bankTotalUSD + depositUSD > bankCapUSD) revert ErrorDepositoExcedeCap();
+        
         vaults[msg.sender][address(0)] += msg.value;
-        totalDeposited += msg.value;
+        totalDepositedByToken[address(0)] += msg.value;
+        bankTotalUSD += depositUSD;
         totalDeposits++;
+
         emit Deposited(msg.sender, msg.value);
     }
 
